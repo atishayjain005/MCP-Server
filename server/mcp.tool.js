@@ -46,22 +46,40 @@ export async function createPost(status) {
             await new Promise(resolve => setTimeout(resolve, 1000 - timeSinceLastRequest));
         }
         
-        // Log the status to debug
-        console.log("Attempting to tweet with status:", status);
-        console.log("Status length:", status.length);
-        
         // Twitter API limit is 280 characters
         if (status.length > 280) {
-            console.log("Status exceeds 280 character limit, truncating...");
-            status = status.substring(0, 277) + "...";
+            // Try to find a natural breakpoint first (sentence end)
+            let truncatedStatus = status;
+            
+            // Look for the last sentence break within the limit
+            const lastPeriodIndex = status.lastIndexOf('.', 270);
+            const lastExclamationIndex = status.lastIndexOf('!', 270);
+            const lastQuestionIndex = status.lastIndexOf('?', 270);
+            
+            // Find the last sentence ending mark within reasonable range of the limit
+            let lastSentenceEndIndex = Math.max(lastPeriodIndex, lastExclamationIndex, lastQuestionIndex);
+            
+            if (lastSentenceEndIndex > 180) {
+                // If we found a reasonable sentence end, use it (and add 1 to include the punctuation)
+                truncatedStatus = status.substring(0, lastSentenceEndIndex + 1);
+            } else {
+                // Otherwise, use a hard truncation but try to avoid cutting words
+                const lastSpaceIndex = status.lastIndexOf(' ', 276);
+                if (lastSpaceIndex > 250) {
+                    // Use word boundary if reasonably close to limit
+                    truncatedStatus = status.substring(0, lastSpaceIndex) + "...";
+                } else {
+                    // Last resort: hard truncation
+                    truncatedStatus = status.substring(0, 277) + "...";
+                }
+            }
+            
+            status = truncatedStatus;
         }
         
         // Remove markdown formatting that might cause issues
         status = status.replace(/\*\*/g, ''); // Remove bold markdown
         status = status.replace(/\*/g, '');   // Remove italic markdown
-        
-        console.log("Cleaned status:", status);
-        console.log("Cleaned status length:", status.length);
         
         rateLimitInfo.lastRequestTime = Date.now();
         const newPost = await twitterClient.v2.tweet(status);
@@ -96,6 +114,18 @@ export async function createPost(status) {
                     {
                         type: "text",
                         text: `Twitter rate limit exceeded. Please wait ${Math.ceil(backoffTime/1000)} seconds before trying again. This is a temporary restriction from Twitter's API.`
+                    }
+                ]
+            };
+        }
+        
+        // Handle permission errors (403 Forbidden)
+        if (error.code === 403 || (error.message && error.message.includes('403'))) {
+            return {
+                content: [
+                    {
+                        type: "text",
+                        text: `Permission error (403 Forbidden): Your Twitter API account doesn't have permission to post tweets. Check your API keys and make sure your developer account has "Read and Write" permissions enabled. Visit https://developer.twitter.com/en/portal/dashboard to update your app permissions.`
                     }
                 ]
             };

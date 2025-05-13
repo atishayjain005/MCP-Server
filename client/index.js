@@ -24,9 +24,6 @@ const rl = readline.createInterface({
 
 mcpClient.connect(new SSEClientTransport(new URL("http://localhost:3000/sse")))
     .then(async () => {
-
-        console.log("Connected to mcp server")
-
         tools = (await mcpClient.listTools()).tools.map(tool => {
             return {
                 name: tool.name,
@@ -39,18 +36,12 @@ mcpClient.connect(new SSEClientTransport(new URL("http://localhost:3000/sse")))
             }
         })
 
-        console.log("Available tools:", tools.map(tool => tool.name))
         chatLoop()
-
-
     })
 
 async function chatLoop(toolCall) {
 
     if (toolCall) {
-
-        console.log("calling tool ", toolCall.name)
-
         chatHistory.push({
             role: "model",
             parts: [
@@ -107,30 +98,46 @@ async function chatLoop(toolCall) {
                 statusText = statusText.replace(/^\*\*X Post:\*\*\n\n/g, ''); // Remove "X Post:" header
                 statusText = statusText.replace(/\n\*   /g, '\n• '); // Convert markdown bullets to unicode bullets
                 
+                // Remove common introductory phrases
+                statusText = statusText.replace(/^(?:Okay|Ok|Sure|Here|Alright)[,.]?\s+(?:here's|here is|I'll create).*?(?:post|tweet|content).*?[:.]\s*/i, '');
+                statusText = statusText.replace(/^["']|["']$/g, ''); // Remove surrounding quotes if present
+                statusText = statusText.replace(/^(?:Here's|This is) (?:a|an|my).*?(?:post|tweet).*?[:.]\s*/i, '');
+                statusText = statusText.replace(/^\s*(?:post|tweet|share) (?:about|on|for).*?[:.]\s*/i, '');
+                
+                // Extract text after a colon if the user provided content in that format
+                if (statusText.includes(':')) {
+                    const colonIndex = statusText.indexOf(':');
+                    const beforeColon = statusText.substring(0, colonIndex).toLowerCase();
+                    // Only extract after colon if what's before seems like a posting instruction
+                    if (beforeColon.includes('post') || beforeColon.includes('tweet') || 
+                        beforeColon.includes('share') || beforeColon.includes('x')) {
+                        statusText = statusText.substring(colonIndex + 1).trim();
+                    }
+                }
+                
+                // Filter out AI prompting requests and meta-text
+                if (statusText.match(/(?:please|kindly)?\s*(?:provide|give|share|tell me|what is|send).*?(?:content|text|post|tweet|message)/i) ||
+                    statusText.match(/I need.*?(?:content|text|post|tweet|message)/i) ||
+                    statusText.match(/(?:what|how) would you like.*?(?:post|tweet|share)/i)) {
+                    return chatLoop(); // Skip this post and continue conversation
+                }
+                
                 toolArgs = { status: statusText };
-                console.log("Posting to Twitter with status:", toolArgs.status);
             } else {
                 // For other tools, pass the args directly
                 toolArgs = toolCall.args;
             }
             
-            console.log("Tool arguments:", JSON.stringify(toolArgs, null, 2))
-            
             const toolResult = await mcpClient.callTool({
                 name: toolCall.name,
                 arguments: toolArgs
             })
-
-            console.log("Tool result:", JSON.stringify(toolResult, null, 2));
             
             // Check for error message in the response
             const resultText = toolResult.content[0].text;
             if (resultText.includes("Error") || resultText.includes("error")) {
-                console.log("Tool error detected:", resultText);
-                
                 // Special handling for rate limit errors
                 if (resultText.includes("rate limit") || resultText.includes("429")) {
-                    console.log("Rate limit detected, adding special flag to chat history");
                     // Add rate limit flag to prevent retry loops
                     chatHistory.push({
                         role: "user",
@@ -202,22 +209,13 @@ async function chatLoop(toolCall) {
             }
         })
         
-        // Enhanced debugging
-        console.log("Full response:", JSON.stringify(response, null, 2))
-        console.log("Response candidates:", JSON.stringify(response.candidates[0].content.parts, null, 2))
-        
         const part = response.candidates[0].content.parts[0];
-        console.log("First part type:", part.text ? "text" : (part.functionCall ? "functionCall" : "unknown"))
-        
         const functionCall = part.functionCall;
         const responseText = part.text;
 
         if (functionCall) {
-            console.log("Function call detected:", JSON.stringify(functionCall, null, 2))
             return chatLoop(functionCall)
         } else {
-            console.log("No function call detected, responding with text instead")
-            
             // Check if the user's last message was about posting to Twitter/X
             const lastUserMessage = chatHistory.filter(msg => msg.role === "user").pop();
             if (lastUserMessage && lastUserMessage.parts && lastUserMessage.parts.length > 0) {
@@ -235,24 +233,92 @@ async function chatLoop(toolCall) {
                     )
                 );
                 
-                // Check for Twitter-related keywords
-                const isTwitterPostRequest = 
+                // Check for explicit Twitter posting requests
+                const isExplicitTweetRequest = 
                     (userText.includes("post") || userText.includes("tweet") || userText.includes("share")) && 
                     (userText.includes("twitter") || userText.includes(" x ") || 
                      userText.includes("x post") || userText.endsWith("x") || 
-                     userText.includes("social media"));
+                     userText.includes("social media")) &&
+                    // Make sure it's not asking for information about posting
+                    !userText.includes("how") &&
+                    !userText.includes("?") &&
+                    !userText.includes("guide") &&
+                    !userText.includes("help") &&
+                    !userText.includes("explain");
+                
+                // Check for requests where user wants Gemini to write content
+                const isContentGenerationRequest = 
+                    isExplicitTweetRequest && 
+                    (userText.includes("write") || userText.includes("generate") || 
+                     userText.includes("create") || userText.includes("compose") ||
+                     userText.includes("draft") || userText.includes("make"));
+                
+                // Skip posts that are prompting for content unless we're in content generation mode
+                const isPromptingText = responseText && (
+                    responseText.match(/(?:please|kindly)?\s*(?:provide|give|share|tell me|what is|send).*?(?:content|text|post|tweet|message)/i) ||
+                    responseText.match(/I need.*?(?:content|text|post|tweet|message)/i) ||
+                    responseText.match(/(?:what|how) would you like.*?(?:post|tweet|share)/i)
+                );
+                
+                // Don't filter out AI prompting text if the user explicitly asked for content generation
+                const shouldFilterPromptingText = !isContentGenerationRequest && isPromptingText;
                 
                 // Only make the function call for original Twitter requests, not for error responses,
-                // and not if we've already hit a rate limit
-                if (isOriginalRequest && !hasRateLimitFlag && isTwitterPostRequest && responseText && responseText.length > 0) {
-                    console.log("Detected Twitter post request without function call, posting AI's response");
+                // not if we've already hit a rate limit, and apply prompting filter conditionally
+                if (isOriginalRequest && !hasRateLimitFlag && isExplicitTweetRequest && 
+                    responseText && responseText.length > 0 && !shouldFilterPromptingText) {
+                    
+                    // Process the response text to extract just the content
+                    let contentToPost = responseText;
+                    
+                    // Extract text after a colon if the AI provided content in that format
+                    if (contentToPost.includes(':')) {
+                        const colonIndex = contentToPost.indexOf(':');
+                        const beforeColon = contentToPost.substring(0, colonIndex).toLowerCase();
+                        // Only extract after colon if what's before seems like a posting instruction
+                        if (beforeColon.includes('post') || beforeColon.includes('tweet') || 
+                            beforeColon.includes('share') || beforeColon.includes('content')) {
+                            contentToPost = contentToPost.substring(colonIndex + 1).trim();
+                        }
+                    }
+                    
+                    // Remove common introductory phrases
+                    contentToPost = contentToPost.replace(/^(?:Okay|Ok|Sure|Here|Alright)[,.]?\s+(?:here's|here is|I'll create).*?(?:post|tweet|content).*?[:.]\s*/i, '');
+                    contentToPost = contentToPost.replace(/^["']|["']$/g, ''); // Remove surrounding quotes if present
+                    contentToPost = contentToPost.replace(/^(?:Here's|This is) (?:a|an|my).*?(?:post|tweet).*?[:.]\s*/i, '');
                     
                     // Since the AI generated content instead of making a function call,
-                    // we'll post the AI's response to Twitter
+                    // we'll post the cleaned response to Twitter
                     return chatLoop({
                         name: "createPost",
-                        args: { status: responseText }
+                        args: { status: contentToPost }
                     });
+                }
+                
+                // Handle follow-up content requests from user after AI has asked for specifics
+                const previousMessage = chatHistory.length >= 2 ? 
+                    chatHistory[chatHistory.length - 2] : null;
+                
+                if (previousMessage && previousMessage.role === "model" && 
+                    isOriginalRequest && responseText && responseText.length > 0) {
+                    
+                    // Check if previous message was requesting content details
+                    const prevText = previousMessage.parts[0].text.toLowerCase();
+                    const wasAskingForContent = 
+                        prevText.includes("provide") && prevText.includes("content") ||
+                        prevText.includes("what") && prevText.includes("like") && 
+                        (prevText.includes("post") || prevText.includes("tweet"));
+                    
+                    if (wasAskingForContent) {
+                        // Extract the content to post, ensuring we're just getting the user's content
+                        let contentToPost = responseText;
+                        
+                        // Since this is a direct response to an AI question, use it directly
+                        return chatLoop({
+                            name: "createPost",
+                            args: { status: contentToPost }
+                        });
+                    }
                 }
             }
         }
@@ -273,5 +339,7 @@ async function chatLoop(toolCall) {
         console.log("AI: Sorry, I encountered an error. Please try again.");
     }
 
-    chatLoop()
+    // Start a new prompt cycle instead of recursively calling
+    setTimeout(() => { chatLoop(); }, 100);
+    return;
 }

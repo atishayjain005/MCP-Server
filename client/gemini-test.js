@@ -62,9 +62,6 @@ async function testAiGeneration() {
 
         const functionCall = response.candidates[0].content.parts[0].functionCall;
         const responseText = response.candidates[0].content.parts[0].text;
-
-        console.log("Response text:", responseText);
-        console.log("Function call:", functionCall ? JSON.stringify(functionCall, null, 2) : "No function call");
     } catch (error) {
         console.error("Error calling Gemini API:", error);
     }
